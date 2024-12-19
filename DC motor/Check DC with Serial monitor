@@ -1,0 +1,81 @@
+//Use L298N DC Motor driver
+// Set Pin
+const int IN1 = 18;
+const int IN2 = 19;
+const int ENA = 5;
+
+const int IN3 = 33;
+const int IN4 = 32;
+const int ENB = 27;
+
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+}
+
+void loop() {
+  Serial.begin(115200);
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n'); // Read string until line break
+    command.trim(); // Remove spaces from string
+
+    if (command.equalsIgnoreCase("stop")) {
+      stop(); // Motor stops when "stop" commanded 
+      Serial.println("Motor stopped.");
+    } else if (command.equalsIgnoreCase("go")) {
+      forward();
+      Serial.println("go");
+    } else if (command.equalsIgnoreCase("back")) {
+      backward();
+      Serial.println("back");
+    } else if (command.equalsIgnoreCase("right")) {
+      right();
+      Serial.println("right");
+    } else if (command.equalsIgnoreCase("left")) {
+      left();
+      Serial.println("left");
+    } else if (command.equalsIgnoreCase("straight")) {
+      straight();
+      Serial.println("straight");
+    }
+  }
+}
+// motor control functions
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 100);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, 100);  // set speed (0~255) PWM Value
+}
+
+void stop() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+void right() {
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 255);
+}
+
+void left() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, 255);
+}
+
+void straight() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
