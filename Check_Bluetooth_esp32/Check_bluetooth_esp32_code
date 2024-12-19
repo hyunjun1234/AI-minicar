@@ -1,0 +1,65 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLECharacteristic.h>
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b" // Service UUID
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Characteristic UUID
+
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("Device connected"); // Print Connection message
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("Device disconnected"); // Print disconnection message
+    pServer->getAdvertising()->start(); //Start advertising again when disconnected
+  }
+};
+
+// Received data processing callback function
+class MyCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    String receivedData = pCharacteristic->getValue().c_str();  // Convert std::string to Arduino String
+    Serial.print("Received data: ");
+    Serial.println(receivedData); // Print received data
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Delay reset
+  Serial.println("Starting BLE...");
+
+  // BLE reset
+  BLEDevice::init("ESP32_S3_BLE");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create BLE service and characteristic
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                     CHARACTERISTIC_UUID,
+                     BLECharacteristic::PROPERTY_READ |
+                     BLECharacteristic::PROPERTY_WRITE
+                   );
+
+  pCharacteristic->setCallbacks(new MyCallbacks());  // Set up data reception callback 
+  pCharacteristic->setValue("Hello from ESP32-S3!");
+
+  // Start service
+  pService->start();
+
+  // Start BLE advertising (so clients can connect)
+  pServer->getAdvertising()->start();
+  Serial.println("BLE advertising started...");
+}
+
+void loop() {
+  // Periodically transmit data to the client when connected
+}
