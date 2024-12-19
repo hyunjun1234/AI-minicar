@@ -1,0 +1,24 @@
+#include <nvs_flash.h>
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000); // waiting Serial reset
+    esp_err_t ret = nvs_flash_init(); // NVS reset
+
+    if (ret == ESP_OK) {
+        Serial.println("NVS initialized successfully.");
+    } else if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("NVS needs to be erased. Erasing now...");
+        nvs_flash_erase(); // Clearing flash memory when NVS initialization fails
+        ret = nvs_flash_init(); // reset again
+        if (ret == ESP_OK) {
+            Serial.println("NVS erased and re-initialized successfully.");
+        } else {
+            Serial.printf("NVS re-initialization failed. Error: %d\n", ret);
+        }
+    } else {
+        Serial.printf("NVS initialization failed. Error: %d\n", ret);
+    }
+}
+
+void loop() {}
