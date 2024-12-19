@@ -1,0 +1,749 @@
+#ifndef ESP32
+#error This example runs on ESP32
+#endif
+
+#include <SPIFFS.h>
+#include <TinyGPS++.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLECharacteristic.h>
+#include <BLE2902.h>
+#include <Wire.h>
+#include <QMC5883LCompass.h>
+#include <LDS_YDLIDAR_X3_PRO.h>
+#define LDS_MOTOR_PWM_FREQ    10000
+#define LDS_MOTOR_PWM_BITS    11
+#define LDS_MOTOR_PWM_CHANNEL    2 // ESP32 PWM channel for LiDAR motor speed control
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b" // 서비스 UUID
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8" // 특성 UUID
+
+// L298N 모터 제어 핀 정의
+const int IN1 = 19;
+const int IN2 = 18;
+const int ENA = 5;
+const int IN3 = 33;
+const int IN4 = 32;
+const int ENB = 27;
+
+const uint8_t LDS_MOTOR_EN_PIN = 4; // ESP32 Dev Kit LiDAR enable pin
+const uint8_t LDS_MOTOR_PWM_PIN = 15; // LiDAR motor speed control using PWM
+HardwareSerial LidarSerial(1); // TX 25, RX 26
+LDS_YDLIDAR_X3_PRO lidar;
+
+//객체 생성
+QMC5883LCompass compass;
+
+//bluetooth 관련 변수 정의
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+String command = "";  // 현재 명령을 저장할 변수
+int pwmValue = 0;
+bool isDriving = false; // 주행 시작 여부를 나타내는 플래그
+float targetLatitude = 0.0;
+float targetLongitude = 0.0;
+float mD = 5.0;
+float currentLatitude = 0.0;
+float currentLongitude = 0.0;
+//unsigned long previousMillis = 0; // 마지막으로 좌표를 출력한 시각 저장
+//const unsigned long interval = 1000; // 1초 간격
+float distance1 = 0.0;
+float distance = 0.0;
+int targetRoadPointIndex = -1;
+bool visited[100] = {false};
+float heading = 0.0; // 전역 변수로 선언
+bool isMovingForward = false; // 전역 변수로 현재 상태를 추적
+
+const float MAX_DISTANCE_FROM_ROAD = 5;  // 도로를 벗어나는 최대 허용 거리 (미터)
+
+//자편각
+float declinationAngle = -8.75;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("Device connected"); // 연결 메시지 출력
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("Device disconnected"); // 연결 해제 메시지 출력
+      pServer->getAdvertising()->start(); // 연결 해제 시 다시 광고 시작
+    }
+};
+
+//함수 전처리
+void moveTowardTargetUsingRoad(float currentLat, float currentLon, float targetLat, float targetLon);
+int findClosestRoadPoint(float currentLat, float currentLon);
+int findClosestRoadPoint2(float currentLat, float currentLon);
+int findNextRoadPoint(float currentLat, float currentLon, float targetLat, float targetLon);
+void loadRoadPath();  //도로 좌표 저장
+void adjustDirection(float recoveryBearing);
+void sendSerialToBLE(String data);
+void sendSerialToBLEln(String data);
+
+//거리, 각도 계산
+float calculateBearing(float lat1, float lon1, float lat2, float lon2) ;
+float calculateDistance(float lat1, float lon1, float lat2, float lon2);
+
+//목표좌표 저장(파싱)
+void parseCoordinates(String data);
+void stop();
+void right();
+void left();
+void forward();
+void backward();
+void straight();
+void handleObstacleAvoidance();
+
+//GPS 업데이트 주기 바꾸기
+void setGPSUpdateRate(int hz);
+
+//Lidar
+int lidar_serial_read_callback();
+size_t lidar_serial_write_callback(const uint8_t * buffer, size_t length);
+void lidar_scan_point_callback(float angle_deg, float distance_mm, float quality, bool scan_completed);
+void lidar_info_callback(LDS::info_t code, String info);
+void lidar_error_callback(LDS::result_t code, String aux_info);
+void lidar_motor_pin_callback(float value, LDS::lds_pin_t lidar_pin);
+void lidar_packet_callback(uint8_t * packet, uint16_t length, bool scan_completed);
+
+struct GPSPoint {
+  float latitude;
+  float longitude;
+};
+
+struct Lidarda {
+  float dis;
+  float an;
+};
+
+GPSPoint roadPath[100];  // 도로 경로 배열
+int pathLength = 0;
+
+Lidarda obstacle[360];
+int lidarLength = 0;
+int flag = 0;
+
+float sLatitude[100] = {36.317745, 36.3177789, 36.3177791, 36.3177968, 36.3178248, 36.3178557, 36.3178769, 36.3178991, 36.3179933, 36.3179703, 36.3180303, 36.3180693, 36.3180535, 36.3180921, 36.3181097, 36.3181501, 36.318132, 36.3181958, 36.3181725, 36.318195, 36.318218, 36.318237, 36.3182435, 36.318253, 36.3182632, 36.318272, 36.3182817, 36.318279, 36.318287, 36.318284, 36.318295, 36.318306, 36.31831, 36.3183172, 36.318321, 36.3183249, 36.3183263, 36.31834, 36.3183522, 36.318379, 36.3183699, 36.3183918, 36.3184195, 36.3184143, 36.3184317, 36.3184552, 36.3184638, 36.3184751, 36.3184994, 36.3185097, 36.3185141, 36.318539, 36.3185503, 36.3185592, 36.3185842, 36.3185916, 36.3186105, 36.3186282, 36.3186298, 36.3186624, 36.3186731, 36.318672, 36.3187127, 36.3187126, 36.3187191, 36.3187615, 36.318749, 36.3187667, 36.3187844, 36.3188097, 36.3188111, 36.318813, 36.3188336, 36.3188546, 36.318851, 36.3188555, 36.3188557, 36.3188557, 36.3188552, 36.3188592, 36.318857, 36.3188573, 36.3188568, 36.3188579, 36.318857, 36.3182429, 36.3179493, 36.3178683, 36.3177381, 36.3178183, 36.3178337, 36.3179307, 36.3177581, 36.3180104, 36.3182006, 36.3179101, 36.3188583};
+float sLongitude[100] = {127.367424, 127.3675334, 127.3673832, 127.3675837, 127.3673522, 127.36772, 127.367763, 127.3678, 127.3672524, 127.3678217, 127.3672318, 127.3672071, 127.3678227, 127.3671827, 127.367825, 127.3671608, 127.367829, 127.3671364, 127.3678458, 127.367798, 127.36776, 127.367714, 127.3678892, 127.367668, 127.367175, 127.367622, 127.3678877, 127.367226, 127.367577, 127.3670909, 127.367279, 127.367531, 127.367332, 127.3678794, 127.367485, 127.3670797, 127.3673829, 127.367439, 127.3678691, 127.3674407, 127.3670527, 127.3678604, 127.367446, 127.3670257, 127.36785, 127.3669987, 127.3674517, 127.3678397, 127.3669693, 127.367458, 127.3678303, 127.366951, 127.367828, 127.3674647, 127.3669503, 127.3678177, 127.3674713, 127.3669476, 127.3678023, 127.367479, 127.3669469, 127.36779, 127.3674877, 127.3677756, 127.3669456, 127.3674943, 127.3677547, 127.3669463, 127.3677313, 127.3675027, 127.3669456, 127.367691, 127.3676457, 127.3675073, 127.367599, 127.3669456, 127.3675527, 127.3673837, 127.3674401, 127.3672797, 127.367331, 127.367069, 127.3671307, 127.3671807, 127.3670033, 127.3671059, 127.3672754, 127.3673247, 127.3674132, 127.3676268, 127.3676761, 127.367819, 127.367477, 127.367821, 127.3678908, 127.367298, 127.3672308};
+
+//사용자로부터 블루투스로 입력받은 데이터 처리
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String receivedData = pCharacteristic->getValue().c_str();  // std::string을 Arduino String으로 변환
+      Serial.print("Received data: ");
+      Serial.println(receivedData); // 수신한 데이터 출력
+
+      if (!receivedData.isEmpty() && receivedData.indexOf(',') != -1) {  // 좌표 값 포함
+        parseCoordinates(receivedData);  // 좌표로 인식하여 파싱
+
+        //목표 지점 도로 좌표 계산
+        targetRoadPointIndex = findClosestRoadPoint2(targetLatitude, targetLongitude);
+        Serial.print("targetRoadPointIndex: ");
+        Serial.println(targetRoadPointIndex);
+        if (targetRoadPointIndex == -1) {
+          Serial.println("No valid road point near target found. Expanding range...");
+        }
+        //미니카의 첫 진행방향 선정
+        // 자율주행이 이미 시작된 상태라면 멈추도록 설정
+        if (isDriving) {
+          isDriving = false; // 자율주행 종료
+          stop();
+          Serial.println("Driving stopped due to new target coordinates.");
+        }
+      } else if (receivedData.toInt() > 0) {  // 숫자만 입력된 경우 PWM 값으로 인식
+        pwmValue = receivedData.toInt();
+        Serial.print("PWM Value set to: ");
+        Serial.println(pwmValue);
+      } else if (receivedData == "start") {  // start 명령으로 주행 시작
+        isDriving = true;
+        Serial.println("Starting autonomous driving...");
+      } else if (receivedData == "stopg") {  // stop 명령으로 주행 중지
+        stop(); // 미니카 정지
+        delay(100);
+        isMovingForward = false;
+        visited[100] = {false};
+        isDriving = false;
+        for (int i = 0; i < 360; i++) {
+          obstacle[i].an = 0;
+          obstacle[i].dis = 9999;
+        }
+        Serial.println("Autonomous driving stopped.");
+      } else {
+        command = receivedData;  // 명령어로 인식
+      }
+    }
+};
+
+// Bluetooth 데이터에서 위도와 경도를 파싱하는 함수
+void parseCoordinates(String data) {
+  int commaIndex = data.indexOf(',');
+  if (commaIndex != -1) {
+    targetLatitude = data.substring(0, commaIndex).toFloat();
+    targetLongitude = data.substring(commaIndex + 1).toFloat();
+    Serial.print("Target set to: ");
+    Serial.print(targetLatitude, 6);
+    Serial.print(", ");
+    Serial.println(targetLongitude, 6);
+  }
+}
+
+TinyGPSPlus gps;
+
+//도로에 해당하는 좌표들을 담은 파일에서 데이터 불러오기
+void loadRoadPath() {
+  for (int i = 0; i < 100; i++) {
+    roadPath[i].latitude = sLatitude[i];
+    roadPath[i].longitude = sLongitude[i];
+    Serial.print(pathLength);
+    Serial.print(" : ");
+    Serial.print("Loaded point: "); // 디버깅용 출력
+    Serial.print("Lat: ");
+    Serial.print(roadPath[i].latitude, 6);
+    Serial.print(", Lon: ");
+    Serial.println(roadPath[i].longitude, 6);
+
+    pathLength++;
+  }
+}
+
+void sendSerialToBLE(String data) {
+  if (deviceConnected) { // BLE 연결 상태 확인
+    pCharacteristic->setValue(data.c_str()); // BLE 특성에 데이터 설정
+    pCharacteristic->notify();              // BLE 데이터 송신
+  }
+}
+
+
+void sendSerialToBLEln(String data) {
+  if (deviceConnected) {
+    data += "\n"; // 줄바꿈 추가
+    pCharacteristic->setValue(data.c_str());
+    pCharacteristic->notify();
+  }
+}
+
+int lidar_serial_read_callback() {
+  return LidarSerial.read();
+}
+
+size_t lidar_serial_write_callback(const uint8_t * buffer, size_t length) {
+  return LidarSerial.write(buffer, length);
+}
+
+void lidar_scan_point_callback(float angle_deg, float distance_mm, float quality, bool scan_completed) {
+  lidarLength = (int)angle_deg;
+  if (distance_mm > 100 && distance_mm < 1500) {
+    // Update obstacle data if an object is within safe distance
+    if ((angle_deg > 270 && angle_deg < 360) || (angle_deg > 0 && angle_deg < 90)) {
+      // Update obstacle data if an object is within safe distance
+      obstacle[lidarLength].an = angle_deg;
+      obstacle[lidarLength].dis = distance_mm;
+      /*Serial.print(lidarLength);
+      Serial.print(' ');
+      Serial.print(distance_mm);
+      Serial.print(' ');
+      Serial.println(angle_deg);*/
+    }
+  }
+}
+
+void lidar_info_callback(LDS::info_t code, String info) {
+  Serial.print("LiDAR info ");
+  Serial.print(lidar.infoCodeToString(code));
+  Serial.print(": ");
+  Serial.println(info);
+}
+void lidar_error_callback(LDS::result_t code, String aux_info) {
+  Serial.print("LiDAR error ");
+  Serial.print(lidar.resultCodeToString(code));
+  Serial.print(": ");
+  Serial.println(aux_info);
+}
+
+void lidar_motor_pin_callback(float value, LDS::lds_pin_t lidar_pin) {
+  int pin = (lidar_pin == LDS::LDS_MOTOR_EN_PIN) ?
+            LDS_MOTOR_EN_PIN : LDS_MOTOR_PWM_PIN;
+
+  if (value <= LDS::DIR_INPUT) {
+    // Configure pin direction
+    if (value == LDS::DIR_OUTPUT_PWM) {
+      ledcSetup(LDS_MOTOR_PWM_CHANNEL, LDS_MOTOR_PWM_FREQ, LDS_MOTOR_PWM_BITS);
+      ledcAttachPin(pin, LDS_MOTOR_PWM_CHANNEL);
+    } else
+      pinMode(pin, (value == LDS::DIR_INPUT) ? INPUT : OUTPUT);
+    return;
+  }
+
+  if (value < LDS::VALUE_PWM) // set constant output
+    digitalWrite(pin, (value == LDS::VALUE_HIGH) ? HIGH : LOW);
+  else { // set PWM duty cycle
+    int pwm_value = ((1 << LDS_MOTOR_PWM_BITS) - 1) * value;
+    ledcWrite(LDS_MOTOR_PWM_CHANNEL, pwm_value);
+  }
+}
+void lidar_packet_callback(uint8_t * packet, uint16_t length, bool scan_completed) {
+  return;
+}
+
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  analogWrite(ENA, 0);   // PWM 초기화: 0으로 설정
+  analogWrite(ENB, 0);   // PWM 초기화: 0으로 설정
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  Serial.begin(115200);
+  delay(100);
+  uint32_t baud_rate = lidar.getSerialBaudRate();
+  LidarSerial.begin(baud_rate, SERIAL_8N1, 26, 25);
+  Serial.println("Starting BLE...");
+  Wire.begin(21, 22);   // I2C 핀 설정: SDA = 21, SCL = 22
+  delay(100);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17); // GPS 통신 설정(,,RX,TX)
+  delay(100);
+
+  lidar.setScanPointCallback(lidar_scan_point_callback);
+  lidar.setPacketCallback(lidar_packet_callback);
+  lidar.setSerialWriteCallback(lidar_serial_write_callback);
+  lidar.setSerialReadCallback(lidar_serial_read_callback);
+  lidar.setMotorPinCallback(lidar_motor_pin_callback);
+  lidar.init();
+
+  LDS::result_t result = lidar.start();
+
+  compass.init(); // QMC5883L 초기화
+  Serial.println("나침반 초기화!");
+
+  for (int i = 0; i < 360; i++) {
+    obstacle[i].an = 0;
+    obstacle[i].dis = 9999;
+  }
+  loadRoadPath();
+
+  // BLE 초기화
+  BLEDevice::init("ESP32_BLE");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // BLE 서비스 및 특성 생성
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_INDICATE
+                    );
+  pCharacteristic->setCallbacks(new MyCallbacks());  // 데이터 수신 콜백 설정
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pCharacteristic->setValue("Hello from ESP32-S3!");
+
+  // 서비스 시작
+  pService->start();
+
+  // BLE 광고 시작 (클라이언트가 연결할 수 있도록)
+  pServer->getAdvertising()->start();
+  Serial.println("BLE advertising started...");
+
+  // GPS 데이터가 있을 경우 처리
+  if (Serial2.available() > 0) {
+    gps.encode(Serial2.read());
+    if (gps.location.isUpdated()) {
+      currentLatitude = gps.location.lat();
+      currentLongitude = gps.location.lng();
+
+      Serial.print("Current location: ");
+      Serial.print(currentLatitude, 6);
+      Serial.print(", ");
+      Serial.println(currentLongitude, 7);
+    } else {
+      Serial.println("NO GPS");
+    }
+  } else {
+    Serial.println("GPS NOT FOUNDED");
+  }
+  isDriving = false;
+}
+
+// 두 GPS 좌표 간 거리 계산 함수 (단위: 미터)
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000; // 지구 반경 (미터)
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  float a = sin(dLat / 2) * sin(dLat / 2) + cos(radians(lat1)) * cos(radians(lat2)) * sin(dLon / 2) * sin(dLon / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+// 방위각 계산(현재위도,현재경도,목표위도,목표경도)
+float calculateBearing(float lat1, float lon1, float lat2, float lon2) {
+  float y = sin(radians(lon2 - lon1)) * cos(radians(lat2));
+  float x = cos(radians(lat1)) * sin(radians(lat2)) - sin(radians(lat1)) * cos(radians(lat2)) * cos(radians(lon2 - lon1));
+  return fmod((degrees(atan2(y, x)) + 360), 360);
+}
+
+// 도로 경로 내 가장 가까운 좌표를 찾고 해당 좌표의 인덱스 반환
+int findClosestRoadPoint(float currentLat, float currentLon) {
+  float minDistance = MAX_DISTANCE_FROM_ROAD;
+  int closestIndex = -1;
+  //불러온 spiffs의 도로좌표들의 배열 수만큼 반복
+  //현재위치와 가장 가까운 도로좌표를 찾아내서 해당 배열의 번수를 변수에 저장
+  for (int i = 0; i < pathLength; i++) {
+    if (visited[i]) continue; // 이미 방문한 도로 좌표는 건너뛴다
+    //도로 좌표와 현재 좌표의 거리를 계산하여 변수에 저장
+    distance1 = calculateDistance(currentLat, currentLon, roadPath[i].latitude, roadPath[i].longitude);
+    //만약 거리가 설정된 최대 거리보다 작을 시 minDistance값으로 갱신
+    //갱신 이후로도 더 작은 값이 나오면 갱신
+    //갱신될 때만 해당 인덱스를 closestIndex에 저장
+    if (distance1 < minDistance) {
+      minDistance = distance1;
+      closestIndex = i;
+    }
+  }
+  return closestIndex;
+}
+
+// 현재 위치에서 가장 적합한 다음 도로 지점을 찾는 함수
+int findNextRoadPoint(float currentLat, float currentLon, float targetLat, float targetLon) {
+  float targetBearing = calculateBearing(currentLat, currentLon, targetLat, targetLon);
+  float minBearingDifference = 360.0; // 초기화: 최대 값
+  float minDistance = 1e6;            // 초기화: 큰 값
+  int nextPointIndex = -1;
+
+  // 진행 방향 필터링 범위
+  float minAllowedBearing = heading - 90;
+  float maxAllowedBearing = heading + 90;
+
+  // 허용 범위를 0~360도로 정규화
+  if (minAllowedBearing < 0) {
+    minAllowedBearing += 360;
+  }
+  if (maxAllowedBearing >= 360) {
+    maxAllowedBearing -= 360;
+  }
+
+  // 도로 배열 전체를 탐색
+  for (int i = 0; i < pathLength; i++) {
+    if (visited[i]) continue; // 현재 지점 또는 이미 방문한 지점은 제외
+
+    float nextLat = roadPath[i].latitude;
+    float nextLon = roadPath[i].longitude;
+
+    // 현재 위치에서 다음 도로 지점까지의 거리 및 방위각
+    float distanceToNextPoint = calculateDistance(currentLat, currentLon, nextLat, nextLon);
+    float bearingToNextPoint = calculateBearing(currentLat, currentLon, nextLat, nextLon);
+
+    // 방위각이 허용 범위 안에 있는지 확인
+    bool isInAllowedRange = false;
+
+    if (minAllowedBearing <= maxAllowedBearing) {
+      isInAllowedRange = (bearingToNextPoint >= minAllowedBearing && bearingToNextPoint <= maxAllowedBearing);
+    } else {
+      isInAllowedRange = (bearingToNextPoint >= minAllowedBearing || bearingToNextPoint <= maxAllowedBearing);
+    }
+
+    // **진행 방향 필터링: 허용 범위 안에 있으면 우선 고려**
+    if (isInAllowedRange) {
+      float bearingDifference = fabs(heading - bearingToNextPoint);
+      if (bearingDifference > 180.0) {
+        bearingDifference = 360.0 - bearingDifference; // 차이 값은 0~180 사이로 유지
+      }
+
+      // 최적의 다음 지점 선택 기준: 허용 범위 안에서는 진행 방향과의 방위각 차이가 작고, 거리가 가까운 점 선택
+      if (bearingDifference < minBearingDifference ||
+          (bearingDifference == minBearingDifference && distanceToNextPoint < minDistance)) {
+        minBearingDifference = bearingDifference;
+        minDistance = distanceToNextPoint;
+        nextPointIndex = i;
+      }
+    } else {
+      // **허용 범위를 벗어난 경우: targetBearing과의 차이를 기준으로 추가 고려**
+      float bearingDifference = fabs(targetBearing - bearingToNextPoint);
+      if (bearingDifference > 180.0) {
+        bearingDifference = 360.0 - bearingDifference; // 차이 값은 0~180 사이로 유지
+      }
+
+      // 허용 범위 바깥에서도 최적의 점을 선택
+      if (bearingDifference < minBearingDifference ||
+          (bearingDifference == minBearingDifference && distanceToNextPoint < minDistance)) {
+        minBearingDifference = bearingDifference;
+        minDistance = distanceToNextPoint;
+        nextPointIndex = i;
+      }
+    }
+  }
+
+  return nextPointIndex;
+}
+
+
+// 도로 경로 내 가장 가까운 좌표를 찾고 해당 좌표의 인덱스 반환
+int findClosestRoadPoint2(float currentLat, float currentLon) {
+  float minDistance = MAX_DISTANCE_FROM_ROAD + mD;
+  int closestIndex = -1;
+  //불러온 spiffs의 도로좌표들의 배열 수만큼 반복
+  //현재위치와 가장 가까운 도로좌표를 찾아내서 해당 배열의 번수를 변수에 저장
+  for (int i = 0; i < pathLength; i++) {
+    if (visited[i]) continue; // 이미 방문한 도로 좌표는 건너뛴다
+    //도로 좌표와 현재 좌표의 거리를 계산하여 변수에 저장
+    float distance = calculateDistance(currentLat, currentLon, roadPath[i].latitude, roadPath[i].longitude);
+    //만약 거리가 설정된 최대 거리보다 작을 시 minDistance값으로 갱신
+    //갱신 이후로도 더 작은 값이 나오면 갱신
+    //갱신될 때만 해당 인덱스를 closestIndex에 저장
+    if (distance < minDistance) {
+      minDistance = distance;
+      closestIndex = i;
+    }
+  }
+  return closestIndex;
+}
+
+void moveTowardTargetUsingRoad(float currentLat, float currentLon, float targetLat, float targetLon) {
+  // 현재 위치에서 가장 가까운 도로 지점 찾기
+  /*int closestPointIndex = findClosestRoadPoint(currentLat, currentLon);
+  if (closestPointIndex == -1) {
+    Serial.println("Find on more large range");
+    closestPointIndex = findClosestRoadPoint2(currentLat, currentLon);
+  }*/
+  
+  //목적지에 도달 시 정지
+  /*if (closestPointIndex == targetRoadPointIndex) {
+    Serial.println("Reached the target road point. Stopping the car.");
+    stop();
+    isDriving = false;  // 주행 중지
+  }*/
+
+  // 현재 위치에서 가장 적합한 다음 도로 지점 선택
+  int nextPointIndex = findNextRoadPoint(currentLat, currentLon, targetLat, targetLon);
+
+  if (nextPointIndex == -1) {
+    Serial.println("No valid next road point found. Stopping...");
+    stop();
+  }
+  visited[nextPointIndex] = true; // 현재 위치를 방문 상태로 기록
+  float nextLat = roadPath[nextPointIndex].latitude;
+  float nextLon = roadPath[nextPointIndex].longitude;
+  // 다음 지점으로 이동
+  float roadBearing = calculateBearing(currentLat, currentLon, nextLat, nextLon);
+  if (!isMovingForward) { // 이미 전진 상태면
+    forward();
+    isMovingForward = true; // 상태 갱신
+  }
+  //장애물 발생 시 회피부터 처리
+  handleObstacleAvoidance();
+  adjustDirection(roadBearing);
+}
+
+void adjustDirection(float recoveryBearing) {
+  float bearingDifference = recoveryBearing - heading;
+  if (bearingDifference > 180) bearingDifference -= 360;
+  if (bearingDifference < -180) bearingDifference += 360;
+
+  if (flag == 1) {
+    left();
+    delay(300);
+    straight();
+    delay(150);
+    flag = 0;
+    //Serial.println("left");
+    return;
+  } else if (flag == 2) {
+    right();
+    delay(300);
+    straight();
+    delay(150);
+    flag = 0;
+    //Serial.println("right");
+    return;
+  } else if (flag == 0) {
+    if (bearingDifference > 5 && bearingDifference <= 35) {
+      right();
+      delay(200);
+      straight();
+      delay(100);
+    } else if (bearingDifference > 35 && bearingDifference <= 90) {
+      right();
+      delay(400);
+      straight();
+      delay(100);
+    } else if (bearingDifference > 90 && bearingDifference <= 135) {
+      right();
+      delay(600);
+      straight();
+      delay(100);
+    } else if (bearingDifference < -5 && bearingDifference >= -35) {
+      left();
+      delay(200);
+      straight();
+    } else if (bearingDifference < -35 && bearingDifference >= -90) {
+      left();
+      delay(400);
+      straight();
+      delay(100);
+    } else if (bearingDifference < -90 && bearingDifference >= -135) {
+      left();
+      delay(600);
+      straight();
+      delay(100);
+    }
+  }
+}
+
+void handleObstacleAvoidance() {
+  int r = 0;
+  int l = 0;
+  for (int i = 0; i < 360; i++) {
+    if (obstacle[i].an > 0 && obstacle[i].an < 90) {
+      if (obstacle[i].dis > 50 && obstacle[i].dis < 1500) {
+        //flag = 1;
+        l++;
+      }
+    } else if (obstacle[i].an > 270 && obstacle[i].an < 360 ) {
+      if (obstacle[i].dis > 50 && obstacle[i].dis < 1500) {
+        //flag = 2;
+        r++;
+      }
+    }
+    obstacle[i].an = 0;
+    obstacle[i].dis = 9999;
+  }
+  if (l > r) {
+    flag = 1;
+  } else if (r > l) {
+    flag = 2;
+  }
+  l = 0;
+  r = 0;
+  Serial.println(flag);
+}
+
+// 모터 제어 함수들
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, pwmValue);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, pwmValue);  // 속도 설정 (0~255)
+}
+
+void stop() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+void right() {
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 255);
+}
+
+void left() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, 255);
+}
+
+void straight() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+//실행문
+void loop() {
+  lidar.loop();
+  //시작 전 미니카 테스트
+  if (command == "go") {
+    forward();
+    command = "";
+  } else if (command == "back") {
+    backward();
+    command = "";  // 명령 실행 후 초기화
+  } else if (command == "stop") {
+    stop();
+    delay(100);
+    command = "";  // 명령 실행 후 초기화
+  } else if (command == "left") {
+    left();
+    command = "";  // 명령 실행 후 초기화
+  } else if (command == "right") {
+    right();
+    command = "";  // 명령 실행 후 초기화
+  } else if (command == "straight") {
+    straight();
+    command = "";  // 명령 실행 후 초기화
+  } else if (command == "cl") {
+    Serial.print(currentLatitude, 6);
+    Serial.print(", ");
+    Serial.println(currentLongitude, 6);
+    command = "";
+  }
+
+  //unsigned long currentMillis = millis();
+  // GPS 데이터가 있을 경우 처리
+  if (Serial2.available() > 0) {
+    gps.encode(Serial2.read());
+    if (gps.location.isUpdated()) {
+      compass.read(); // 센서 데이터 읽기
+
+      int x = compass.getX() + 835;
+      int y = compass.getY() + 215;
+
+      heading = atan2(y, x) * (180 / M_PI) + declinationAngle -20;
+      if (heading < 0) {
+        heading += 360;
+      }
+      if (heading >= 360) {
+        heading -= 360;
+      }
+      Serial.print("진행 방위각 : ");
+      Serial.println(heading);
+
+      /*if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis; // 마지막 출력 시각 갱신
+        Serial.print("Current location: ");
+        Serial.print(currentLatitude, 6);
+        Serial.print(", ");
+        Serial.println(currentLongitude, 7);
+        }*/
+      currentLatitude = gps.location.lat();
+      currentLongitude = gps.location.lng();
+
+      //앱으로 미니카 현재위치 전송
+      sendSerialToBLE(String(currentLatitude, 6) + "," + String(currentLongitude, 6));      // BLE 데이터 전송
+
+      Serial.print("Current location: ");
+      Serial.print(currentLatitude, 6);
+      Serial.print(", ");
+      Serial.println(currentLongitude, 6);
+
+      if (isDriving && currentLatitude != 0.0 && currentLongitude != 0.0) {
+        //현재 위치과 목표 지점 사이의 거리를 계산하여 변수에 저장
+        float distanceToTarget = calculateDistance(currentLatitude, currentLongitude, roadPath[targetRoadPointIndex].latitude, roadPath[targetRoadPointIndex].longitude);
+        Serial.print("Distance to target: ");
+        Serial.println(distanceToTarget);
+        if (distanceToTarget <= 2) {
+          stop();
+          delay(100);
+          Serial.println("Arrived at target location.");
+          isDriving = false;  // 목표 도달 후 주행 멈춤
+        }
+        moveTowardTargetUsingRoad(currentLatitude, currentLongitude, roadPath[targetRoadPointIndex].latitude, roadPath[targetRoadPointIndex].longitude);
+      }
+    }
+  }
+}
