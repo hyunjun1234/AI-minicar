@@ -1,0 +1,37 @@
+#include <Wire.h>
+#include <QMC5883LCompass.h>
+
+QMC5883LCompass compass;
+float declinationAngle = -8.7667; //magnetic variation
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // SDA=21, SCL=22 (ESP32)
+
+  compass.init(); // QMC5883L reset
+}
+
+void loop() {
+  compass.read(); // Read sensor data
+
+  int x = compass.getX()+835;
+  int y = compass.getY()+215;
+
+  float heading = atan2(y,x) * (180 / M_PI);
+  heading += declinationAngle; // magnetic variation correction
+  heading-=20;
+  if (heading < 0) {
+    heading += 360;
+  }
+  if (heading >= 360) {
+    heading -= 360;
+  }
+  //Debug heading bearing
+  Serial.println(heading);
+
+  //Debug For error correction
+  /*Serial.print(x);
+  Serial.print(", ");
+  Serial.println(y);*/
+  delay(50);
+}
